@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CitySOS AI Assistant</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f6f7f9;--card:#fff;--ink:#1c2430;--mut:#6b7686;--acc:#d6342c;--me:#1f4fd8;--meink:#fff;--bd:#e2e6ec;--chip:#eef1f6}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12161c;--card:#1b212a;--ink:#e8ecf2;--mut:#93a0b2;--bd:#2b3441;--chip:#242c38;--me:#3a67e8}}
+:root[data-theme="dark"]{--bg:#12161c;--card:#1b212a;--ink:#e8ecf2;--mut:#93a0b2;--bd:#2b3441;--chip:#242c38;--me:#3a67e8}
+html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
+*{box-sizing:border-box}
+body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Segoe UI",Tahoma,"Noto Naskh Arabic","Noto Sans Arabic",system-ui,sans-serif}
+#app{max-width:760px;margin:0 auto;height:100%;display:flex;flex-direction:column}
+header{padding:12px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--bd);background:var(--card)}
+header .logo{background:var(--acc);color:#fff;font-weight:700;border-radius:8px;padding:4px 9px;letter-spacing:.5px}
+header h1{font-size:16px;margin:0;flex:1}
+.badge{font-size:11px;color:var(--mut);background:var(--chip);padding:3px 8px;border-radius:99px}
+#log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+/* Layout side is fixed (me = right, bot = left); only the TEXT direction follows each message's language */
+.msg{max-width:86%;padding:10px 13px;border-radius:14px;line-height:1.6;font-size:15px;white-space:pre-wrap;background:var(--card);border:1px solid var(--bd)}
+.msg.me{align-self:flex-end;background:var(--me);color:var(--meink);border-color:transparent}
+.msg.bot{align-self:flex-start}
+.msg.em{border-color:var(--acc);border-width:2px}
+.cat{display:inline-block;font-size:12px;font-weight:600;color:#fff;background:var(--acc);border-radius:6px;padding:2px 8px;margin-bottom:6px}
+.cat.ok{background:#2a7d4f}
+.fu{margin-top:8px;font-weight:600}
+.play{margin-top:8px;display:inline-flex;align-items:center;gap:6px;background:var(--chip);color:var(--ink);border:1px solid var(--bd);border-radius:99px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer}
+.chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 14px 8px}
+.chips button{background:var(--chip);color:var(--ink);border:1px solid var(--bd);border-radius:99px;padding:6px 11px;font:inherit;font-size:13px;cursor:pointer}
+form{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--bd);background:var(--card)}
+#in{flex:1;min-width:0;font:inherit;font-size:15px;padding:10px 12px;border:1px solid var(--bd);border-radius:10px;background:var(--bg);color:var(--ink)}
+#mic{min-width:46px;background:var(--chip);color:var(--ink);border:1px solid var(--bd);border-radius:10px;font:inherit;font-size:16px;cursor:pointer;padding:0 10px}
+#mic.rec{background:var(--acc);color:#fff;border-color:var(--acc);animation:pulse 1.2s infinite}
+@keyframes pulse{50%{opacity:.65}}
+#send{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:0 18px;font:inherit;font-weight:600;cursor:pointer}
+#send:disabled,#mic:disabled{opacity:.5}
+.dots{color:var(--mut)}
+</style>
+</head>
+<body>
+<div id="app">
+<header><span class="logo">SOS</span><h1 id="title">CitySOS</h1><span class="badge" id="lang">EN</span><span class="badge" id="mode"></span></header>
+<div id="log" aria-live="polite"></div>
+<div class="chips" id="chips"></div>
+<form id="f"><input id="in" autocomplete="off"><button id="mic" type="button" aria-label="voice">🎤</button><button id="send" type="submit"></button></form>
+</div>
+<script>
+/* ---------- Service categories (one internal taxonomy for both languages) ---------- */
+const CATS={
+ automotive:{ar:"خدمات السيارات (ونش / ميكانيكي / بنزين)",en:"Automotive (tow / mechanic / fuel)"},
+ medical:{ar:"خدمات طبية",en:"Medical services"},
+ pharmacy:{ar:"صيدلية",en:"Pharmacy"},
+ plumbing:{ar:"سباكة",en:"Plumbing"},
+ electrical:{ar:"كهرباء",en:"Electrical"},
+ home_other:{ar:"صيانة منزلية عامة",en:"General home maintenance"},
+ emergency:{ar:"طوارئ",en:"Emergency"},
+ unknown:{ar:"غير محدد",en:"Not identified yet"}
+};
+const UI={
+ ar:{title:"مساعد CitySOS",ph:"اكتب مشكلتك أو اضغط 🎤 وقول مشكلتك…",send:"إرسال",hello:"أهلاً بيك في CitySOS 👋\nاكتب مشكلتك أو ابعتلي رسالة صوتية بالعربي أو بالإنجليزي، وأنا هساعدك أوصلك للخدمة المناسبة.",
+  err:"حصلت مشكلة في الاتصال بالمساعد. جرّب تاني بعد شوية. ولو الحالة طارئة اتصل: إسعاف 123، شرطة 122، إطفاء 180.",ai:"ذكاء اصطناعي",local:"وضع بسيط",svc:"الخدمة المقترحة",emg:"⚠️ حالة طوارئ",
+  listen:"🎤 …",nomic:"المتصفح ده مش بيدعم تسجيل الصوت.",deny:"محتاج تسمح باستخدام المايك علشان تبعت رسالة صوتية.",play:"🔊 اسمع الرد",
+  chips:["العربية بطلت ومش عارف المشكلة إيه.","عندي ماسورة مياه مكسورة، أعمل إيه؟","محتاج أقرب صيدلية.","عندي chest pain ومش قادر أتنفس","النور فصل في الشقة كلها","My car stopped working. What should I do?","Find the nearest pharmacy.","I have a broken water pipe."]},
+ en:{title:"CitySOS Assistant",ph:"Describe your problem or tap 🎤 to speak…",send:"Send",hello:"Welcome to CitySOS 👋\nType or send a voice message in Arabic or English and I'll help you find the right service.\nأهلاً بيك! تقدر تكتب أو تبعت فويس بالعربي كمان.",
+  err:"Something went wrong reaching the assistant. Please try again shortly. If this is an emergency call: ambulance 123, police 122, fire 180.",ai:"AI",local:"Basic mode",svc:"Suggested service",emg:"⚠️ Emergency",
+  listen:"🎤 …",nomic:"This browser can't record audio.",deny:"Please allow microphone access to send a voice message.",play:"🔊 Play reply",
+  chips:["My car stopped working. What should I do?","Find the nearest pharmacy.","I have a broken water pipe.","العربية بطلت ومش عارف المشكلة إيه.","محتاج أقرب صيدلية.","Someone is bleeding badly, please help"]}
+};
+function detect(t){const a=(t.match(/[\u0600-\u06FF]/g)||[]).length,l=(t.match(/[A-Za-z]/g)||[]).length;return a===0&&l===0?null:(a>=l?"ar":"en");}
+
+const $=id=>document.getElementById(id);
+const SID=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():Date.now()+"-"+Math.random().toString(16).slice(2);
+let cur="en",busy=false,rec=null,stream=null,chunks=[],timer=null,mode="";
+
+function setBusy(b){busy=b;$("send").disabled=b;$("mic").disabled=b&&!(rec&&rec.state==="recording");}
+function setMode(m){mode=m||mode;$("mode").textContent=mode?(mode==="ai"?UI[cur].ai:UI[cur].local):"";}
+function applyLang(l){cur=l;document.documentElement.lang=l;
+ $("title").textContent=UI[l].title;$("in").placeholder=UI[l].ph;$("send").textContent=UI[l].send;$("lang").textContent=l==="ar"?"عربي":"EN";setMode();
+ $("chips").innerHTML="";UI[l].chips.forEach(c=>{const b=document.createElement("button");b.type="button";b.textContent=c;b.dir=detect(c)==="ar"?"rtl":"ltr";b.onclick=()=>ask(c);$("chips").appendChild(b)});}
+
+function micStatusMessage(error){
+  const name = error && error.name ? error.name : "";
+  if(name === "NotAllowedError" || name === "PermissionDeniedError") return "Microphone access was blocked. Please allow access in this browser and refresh the page.";
+  if(name === "NotFoundError") return "No microphone was detected on this device.";
+  if(name === "SecurityError") return "This page must be served from localhost or HTTPS to use the microphone.";
+  if(!window.isSecureContext && location.hostname !== "localhost" && !location.hostname.endsWith(".localhost")) return "The page is not running in a secure context. Use localhost or HTTPS.";
+  return UI[cur].deny;
+}
+
+function speakFallback(text,lang){if(!("speechSynthesis" in window)||!text)return;const utterance=new SpeechSynthesisUtterance(text);utterance.lang=lang==="ar"?"ar-EG":"en-US";speechSynthesis.cancel();speechSynthesis.speak(utterance);}
+function playAudio(a,text,lang){try{const el=new Audio("data:"+a.mime+";base64,"+a.base64);return el.play().catch(()=>speakFallback(text,lang)),el}catch(_){speakFallback(text,lang)}}
+function add(text,who,o={}){const m=document.createElement("div");m.className="msg "+who+(o.emg?" em":"");m.dir=o.lang==="ar"?"rtl":"ltr";
+ if(o.cat){const c=document.createElement("div");c.className="cat"+(o.emg?"":" ok");c.textContent=(o.emg?UI[o.lang].emg+" · ":"")+UI[o.lang].svc+": "+CATS[o.cat][o.lang];m.appendChild(c);m.appendChild(document.createElement("br"))}
+ const t=document.createElement("span");t.textContent=text;m.appendChild(t);
+ if(o.fu){const f=document.createElement("div");f.className="fu";f.textContent=o.fu;m.appendChild(f)}
+ if(o.audio){const p=document.createElement("button");p.type="button";p.className="play";p.textContent=UI[o.lang].play;p.onclick=()=>playAudio(o.audio,(text+" "+(o.fu||"")).trim(),o.lang);m.appendChild(document.createElement("br"));m.appendChild(p)}
+ $("log").appendChild(m);$("log").scrollTop=1e9;return m;}
+
+/* Render one backend response as a bot bubble */
+function showReply(j,wait){
+ const L=j.lang==="ar"||j.lang==="en"?j.lang:cur;if(wait)wait.remove();
+ const cat=CATS[j.category]?j.category:"unknown";
+ add(j.reply,"bot",{lang:L,cat:cat!=="unknown"?cat:null,emg:!!j.emergency||cat==="emergency",fu:j.followup,audio:j.audio});
+ applyLang(L);setMode(j.mode);const spoken=(j.reply+" "+(j.followup||"")).trim();if(j.audio)playAudio(j.audio,spoken,L);else if(j.transcript)speakFallback(spoken,L);}
+function failReply(lang,wait){if(wait)wait.remove();add(UI[lang].err,"bot",{lang});}
+
+/* ---------- Text ---------- */
+async function ask(text){
+ text=text.trim();if(!text||busy)return;setBusy(true);$("in").value="";
+ const lang=detect(text)||cur;applyLang(lang);add(text,"me",{lang});
+ const w=add("…","bot",{lang});w.firstChild.className="dots";
+ try{
+  const r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:SID,message:text})});
+  if(!r.ok)throw new Error(r.status);showReply(await r.json(),w);
+ }catch(e){console.warn(e);failReply(lang,w);}
+ setBusy(false);$("in").focus();}
+
+/* ---------- Voice: tap 🎤 to start, tap again to send ---------- */
+function fmt(s){return Math.floor(s/60)+":"+String(s%60).padStart(2,"0");}
+async function toggleRec(){
+ if(busy)return;
+ if(rec&&rec.state==="recording"){rec.stop();return;}
+ if(!window.isSecureContext && location.hostname !== "localhost" && !location.hostname.endsWith(".localhost")){alert("This page must be served from localhost or HTTPS to use the microphone.");return;}
+ if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){alert(UI[cur].nomic);return;}
+ if(!window.MediaRecorder){alert(UI[cur].nomic);return;}
+ try{stream=await navigator.mediaDevices.getUserMedia({
+   audio:{
+     echoCancellation:true,
+     noiseSuppression:true,
+     autoGainControl:true,
+     channelCount:1
+   }
+ });}catch(e){alert(micStatusMessage(e));return;}
+ const type=["audio/webm;codecs=opus","audio/webm","audio/mp4","audio/ogg;codecs=opus"].find(t=>MediaRecorder.isTypeSupported(t))||"";
+ rec=new MediaRecorder(stream,type?{mimeType:type}:undefined);chunks=[];
+ rec.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data)};
+ rec.onstop=()=>{clearInterval(timer);stream.getTracks().forEach(t=>t.stop());
+  $("mic").classList.remove("rec");$("mic").textContent="🎤";
+  const mime=rec.mimeType||type||"audio/webm";sendVoice(new Blob(chunks,{type:mime}),mime);};
+ rec.start();let s=0;$("mic").classList.add("rec");$("mic").textContent="⏹ 0:00";
+ timer=setInterval(()=>{s++;$("mic").textContent="⏹ "+fmt(s);if(s>=60)rec.stop();},1000);}
+
+async function sendVoice(blob,mime){
+ if(blob.size<1500)return; // too short to be speech
+ setBusy(true);
+ const me=add(UI[cur].listen,"me",{lang:cur});
+ const wait=add("…","bot",{lang:cur});wait.firstChild.className="dots";
+ const ext=mime.includes("mp4")?"m4a":mime.includes("ogg")?"ogg":"webm";
+ const fd=new FormData();fd.append("sessionId",SID);fd.append("audio",blob,"voice."+ext);fd.append("replyWithVoice","true");
+ try{
+  const r=await fetch("/api/voice",{method:"POST",body:fd});
+  if(!r.ok){const error=await r.json().catch(()=>({}));throw new Error(error.detail||"Voice request failed ("+r.status+")");}const j=await r.json();
+  if(j.transcript){me.firstChild.textContent=j.transcript;me.dir=j.lang==="ar"?"rtl":"ltr";} // show what was understood
+  showReply(j,wait);
+ }catch(e){console.warn(e);me.remove();if(wait)wait.remove();add(e.message||UI[cur].err,"bot",{lang:cur});}
+ setBusy(false);}
+
+$("f").addEventListener("submit",e=>{e.preventDefault();ask($("in").value)});
+$("mic").addEventListener("click",toggleRec);
+$("in").addEventListener("input",e=>{const l=detect(e.target.value);if(l)e.target.dir=l==="ar"?"rtl":"ltr"});
+applyLang("en");add(UI.en.hello,"bot",{lang:"en"});
+</script>
+</body>
+</html>
