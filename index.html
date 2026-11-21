@@ -89,20 +89,31 @@ function micStatusMessage(error){
 }
 
 function speakFallback(text,lang){if(!("speechSynthesis" in window)||!text)return;const utterance=new SpeechSynthesisUtterance(text);utterance.lang=lang==="ar"?"ar-EG":"en-US";speechSynthesis.cancel();speechSynthesis.speak(utterance);}
+let curEl=null;
+function stopAudio(){if(curEl){try{curEl.pause()}catch(_){}curEl=null}if("speechSynthesis" in window)speechSynthesis.cancel();}
+async function speak(text,lang){
+ stopAudio();
+ try{
+  const r=await fetch("/api/tts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text,lang})});
+  if(!r.ok)throw new Error(r.status);
+  const url=URL.createObjectURL(await r.blob());const el=new Audio(url);curEl=el;
+  el.onended=()=>URL.revokeObjectURL(url);await el.play();
+ }catch(e){console.warn("TTS failed, using browser voice",e);speakFallback(text,lang);}
+}
 function playAudio(a,text,lang){try{const el=new Audio("data:"+a.mime+";base64,"+a.base64);return el.play().catch(()=>speakFallback(text,lang)),el}catch(_){speakFallback(text,lang)}}
 function add(text,who,o={}){const m=document.createElement("div");m.className="msg "+who+(o.emg?" em":"");m.dir=o.lang==="ar"?"rtl":"ltr";
  if(o.cat){const c=document.createElement("div");c.className="cat"+(o.emg?"":" ok");c.textContent=(o.emg?UI[o.lang].emg+" · ":"")+UI[o.lang].svc+": "+CATS[o.cat][o.lang];m.appendChild(c);m.appendChild(document.createElement("br"))}
  const t=document.createElement("span");t.textContent=text;m.appendChild(t);
  if(o.fu){const f=document.createElement("div");f.className="fu";f.textContent=o.fu;m.appendChild(f)}
- if(o.audio){const p=document.createElement("button");p.type="button";p.className="play";p.textContent=UI[o.lang].play;p.onclick=()=>playAudio(o.audio,(text+" "+(o.fu||"")).trim(),o.lang);m.appendChild(document.createElement("br"));m.appendChild(p)}
+ if(o.audio||o.voice){const p=document.createElement("button");p.type="button";p.className="play";p.textContent=UI[o.lang].play;p.onclick=()=>o.audio?playAudio(o.audio,(text+" "+(o.fu||"")).trim(),o.lang):speak((text+" "+(o.fu||"")).trim(),o.lang);m.appendChild(document.createElement("br"));m.appendChild(p)}
  $("log").appendChild(m);$("log").scrollTop=1e9;return m;}
 
 /* Render one backend response as a bot bubble */
 function showReply(j,wait){
  const L=j.lang==="ar"||j.lang==="en"?j.lang:cur;if(wait)wait.remove();
  const cat=CATS[j.category]?j.category:"unknown";
- add(j.reply,"bot",{lang:L,cat:cat!=="unknown"?cat:null,emg:!!j.emergency||cat==="emergency",fu:j.followup,audio:j.audio});
- applyLang(L);setMode(j.mode);const spoken=(j.reply+" "+(j.followup||"")).trim();if(j.audio)playAudio(j.audio,spoken,L);else if(j.transcript)speakFallback(spoken,L);}
+ add(j.reply,"bot",{lang:L,cat:cat!=="unknown"?cat:null,emg:!!j.emergency||cat==="emergency",fu:j.followup,audio:j.audio,voice:!!j.transcript&&!j.audio});
+ applyLang(L);setMode(j.mode);const spoken=(j.reply+" "+(j.followup||"")).trim();if(j.audio)playAudio(j.audio,spoken,L);else if(j.transcript)speak(spoken,L);}
 function failReply(lang,wait){if(wait)wait.remove();add(UI[lang].err,"bot",{lang});}
 
 /* ---------- Text ---------- */
@@ -142,12 +153,12 @@ async function toggleRec(){
  timer=setInterval(()=>{s++;$("mic").textContent="⏹ "+fmt(s);if(s>=60)rec.stop();},1000);}
 
 async function sendVoice(blob,mime){
- if(blob.size<1500)return; // too short to be speech
+ if(blob.size<1500){ add("التسجيل قصير جدًا، جرّب تتكلم أكتر.","bot",{lang:cur}); return; }// too short to be speech
  setBusy(true);
  const me=add(UI[cur].listen,"me",{lang:cur});
  const wait=add("…","bot",{lang:cur});wait.firstChild.className="dots";
  const ext=mime.includes("mp4")?"m4a":mime.includes("ogg")?"ogg":"webm";
- const fd=new FormData();fd.append("sessionId",SID);fd.append("audio",blob,"voice."+ext);fd.append("replyWithVoice","true");
+ const fd=new FormData();fd.append("sessionId",SID);fd.append("audio",blob,"voice."+ext);fd.append("replyWithVoice","false");
  try{
   const r=await fetch("/api/voice",{method:"POST",body:fd});
   if(!r.ok){const error=await r.json().catch(()=>({}));throw new Error(error.detail||"Voice request failed ("+r.status+")");}const j=await r.json();

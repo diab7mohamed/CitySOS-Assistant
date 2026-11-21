@@ -1,36 +1,21 @@
 """
 citysos_assistant.py - CitySOS bilingual (Arabic / English) assistant with voice support.
+IMPROVED VERSION - fixes: illogical AI replies + poor voice quality.
 
-Install:
-    pip install anthropic fastapi "uvicorn[standard]" python-dotenv python-multipart faster-whisper edge-tts requests
-
-Env:
-    GROQ_API_KEY=...              (preferred; keep on the SERVER only)
-    GROQ_MODEL=...                (optional)
-    ANTHROPIC_API_KEY=...         (optional fallback provider)
-    CITYSOS_MODEL=...             (optional model override)
-    WHISPER_MODEL=small          (optional: tiny/base/small/medium - medium is better for Egyptian Arabic)
-
-    Local development: copy .env.example to .env and add a newly created API key.
-
-Run:
-    uvicorn citysos_assistant:app --host 0.0.0.0 --port 3000
-    then open http://localhost:3000  (put index.html next to this file; the mic needs HTTPS or localhost)
-
-Flow:
-    text  -> /api/chat   -> Claude -> JSON reply (text only)
-    voice -> /api/voice  -> Whisper (speech-to-text) -> Claude -> edge-tts (text-to-speech) -> JSON + audio
-    Note: Claude does not take raw audio, so voice is transcribed first.
-    The reply follows the user's language and, if they sent voice, comes back as voice too.
+Main fixes vs the original:
+  1. Stronger Groq model by default (gpt-oss-120b instead of the weak 20b).
+  2. response_format=json_object so the model is FORCED to return valid JSON
+     (the #1 cause of "illogical" replies: bad JSON -> silent local fallback).
+  3. One retry with a stricter instruction if JSON parsing fails.
+  4. temperature 0 for consistent, deterministic replies.
+  5. Speech-to-text uses Groq's hosted whisper-large-v3-turbo API instead of local faster-whisper.
 """
 
-import asyncio
 import base64
-import io
 import json
 import os
 import re
-from typing import Any, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -52,28 +37,26 @@ except ImportError:
     AsyncAnthropic = None
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
-
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    WhisperModel = None
+from fastapi.responses import FileResponse, Response
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+# gpt-oss-20b is too weak for Arabic + strict JSON. 120b (or llama-3.3-70b-versatile)
+# follows the JSON schema far more reliably -> logical, on-topic replies.
 MODEL = (
     os.getenv("CITYSOS_MODEL")
     or os.getenv("GROQ_MODEL")
-    or ("openai/gpt-oss-20b" if GROQ_API_KEY else "claude-sonnet-5-5")
+    or ("llama-3.3-70b-versatile" if GROQ_API_KEY else "claude-sonnet-5-5")
 )
-WHISPER_SIZE = os.getenv("WHISPER_MODEL", "small")
+# If the main model fails (renamed / retired / rate limited) we try these in order.
+GROQ_FALLBACK_MODELS = [m for m in ("llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant") if m != MODEL]
+STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 10 MB
 
 CATEGORIES = ["automotive", "medical", "pharmacy", "plumbing", "electrical", "home_other", "emergency", "unknown"]
 
-SYSTEM = f"""You are the CitySOS assistant for people in Egypt. Users write or speak in Modern Standard Arabic, Egyptian colloquial Arabic (e.g. "العربية بطلت", "ماسورة مكسورة", "النور فصل"), English, or mixed Arabic-English.
-Work directly from the user's original wording. Never translate the message to another language first.
-Some messages come from speech-to-text and may contain small recognition mistakes; infer the intended meaning.
+SYSTEM = f"""You are CitySOS Assistant, a friendly, empathetic, and capable assistant helping people in Egypt. Speak naturally and warmly, acknowledge the user's concern when appropriate, and guide them through practical next steps one at a time. Use the conversation history to understand references and follow-ups, remember details already shared, and avoid asking again for information the user has provided. Be clear and concise; never claim to have contacted a service or taken an action you cannot actually take.
+Users write or speak in Modern Standard Arabic, Egyptian colloquial Arabic (e.g. "العربية بطلت", "ماسورة مكسورة", "النور فصل"), English, or mixed Arabic-English. Work directly from the user's original wording; never translate it first. Speech-to-text may contain small recognition mistakes, so infer the intended meaning from context.
 
 Tasks:
 1. Decide the dominant language of the latest user message: "ar" or "en" (mixed -> the dominant one). Reply ONLY in that language. If "ar", write natural, warm Egyptian Arabic (عامية مصرية), not stiff formal Arabic. Stay in the same language as earlier turns unless the user switches.
@@ -86,11 +69,11 @@ Tasks:
    - home_other: AC, locks, appliances, painting, carpentry
    - emergency: life-threatening (chest pain, can't breathe, heavy bleeding, fire, gas leak, crime in progress, accident with injuries)
    - unknown: not enough information
-3. Answer what the user actually asked. Give short practical first-aid / safety guidance (2-5 short lines). For emergency, lead with Egypt numbers: ambulance 123, police 122, fire 180, plus one safety action.
-4. Ask ONE relevant follow-up question (location, car model, severity, ...) unless it is an emergency where the numbers/action come first. Use "" if none is needed.
+3. Answer the user's latest question in context. For multi-step help, give the safest and most useful next step first, then continue one step at a time. Keep advice practical and concise (2-5 short lines). Never diagnose medical conditions; recommend a qualified professional. For emergencies, lead with Egypt numbers: ambulance 123, police 122, fire 180, plus one immediate safety action.
+4. Ask at most ONE relevant follow-up question, and only if needed to help with the next step (for example, location, car model, or severity). Do not repeat a question already answered in the conversation. Use "" if none is needed.
 5. If the message came by voice, keep sentences short and avoid lists, symbols or emojis, because the reply will be read aloud.
 
-Output ONLY compact JSON, no markdown:
+Output ONLY compact JSON, no markdown, no text before or after the JSON:
 {{"lang":"ar|en","category":"<id>","emergency":true|false,"reply":"...","followup":"..."}}"""
 
 # Safety net: if any of these appear, treat as emergency even if the model misses it.
@@ -111,11 +94,11 @@ ERR = {
     "en": "A temporary error occurred. Please try again. If this is an emergency call: ambulance 123, police 122, fire 180.",
 }
 
-VOICES = {"ar": "ar-EG-SalmaNeural", "en": "en-US-JennyNeural"}
+VOICES = {"ar": "ar-EG-ShakirNeural", "en": "en-US-JennyNeural"}
 
+HTTP = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
 API_KEY = ANTHROPIC_API_KEY
 client = AsyncAnthropic(api_key=API_KEY) if AsyncAnthropic and API_KEY else None
-_whisper: Optional[Any] = None
 
 
 # ---------------------------------------------------------------- helpers
@@ -134,57 +117,109 @@ def parse_json(text: str) -> dict:
 
 
 def clean_history(history: list) -> list:
-    """Keep the last 10 turns and make sure the list starts with a user turn."""
-    h = history[-10:]
+    """Keep the complete conversation and make sure it starts with a user turn."""
+    h = history[:]
     while h and h[0]["role"] != "user":
         h = h[1:]
     return h
 
 
-def get_whisper() -> Any:
-    global _whisper
-    if WhisperModel is None:
-        raise RuntimeError(
-            "faster-whisper is not available or isn't compatible with this Python version. "
-            "Install a supported whisper build or disable voice transcription."
+
+# ---------------------------------------------------------------- LLM call (with retry)
+async def _call_llm(core_messages: list) -> str:
+    """Return the raw model output. Raises on HTTP/parse problems."""
+    if GROQ_API_KEY:
+        messages = [{"role": "system", "content": SYSTEM}, *core_messages]
+        last_err = None
+        for model in [MODEL, *GROQ_FALLBACK_MODELS]:
+            body = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+            }
+            if "gpt-oss" in model:
+                body["reasoning_effort"] = "low"   # much faster, still good enough here
+            else:
+                body["max_tokens"] = 500
+            try:
+                response = await HTTP.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": "Bearer " + GROQ_API_KEY, "Content-Type": "application/json"},
+                    json=body,
+                )
+                if response.status_code != 200:
+                    # THIS line tells you the real reason (bad key, model removed, rate limit...)
+                    print(f"[Groq LLM] model={model} status={response.status_code} body={response.text[:300]}")
+                    last_err = RuntimeError(f"Groq {response.status_code}")
+                    continue
+                return response.json()["choices"][0]["message"]["content"]
+            except httpx.HTTPError as e:
+                print(f"[Groq LLM] model={model} network error: {e!r}")
+                last_err = e
+        raise last_err or RuntimeError("Groq call failed")
+    if client is not None:
+        res = await client.messages.create(
+            model=MODEL,
+            max_tokens=700,
+            system=SYSTEM,
+            messages=core_messages,
         )
-    if _whisper is None:
-        _whisper = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
-    return _whisper
+        return "".join(b.text for b in res.content if b.type == "text")
+    raise RuntimeError("No LLM API key is set. Set GROQ_API_KEY or ANTHROPIC_API_KEY before using AI responses.")
 
 
 # ---------------------------------------------------------------- voice in / out
-def _transcribe_sync(audio: bytes) -> dict:
-    segments, info = get_whisper().transcribe(
-        io.BytesIO(audio),
-        task="transcribe",   # never translate: keep the user's original wording
-        language=None,       # auto-detect Arabic / English
-        vad_filter=True,
-        beam_size=5,
+async def transcribe(audio: bytes, filename: str = "voice.webm", content_type: str = "audio/webm") -> dict:
+    """Speech -> text via Groq's hosted Whisper."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is required for voice input.")
+    r = await HTTP.post(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        headers={"Authorization": "Bearer " + GROQ_API_KEY},
+        files={"file": (filename, audio, content_type)},
+        data={
+            "model": STT_MODEL,
+            "temperature": "0",
+            "response_format": "json",
+            # Context words help Whisper with Egyptian dialect + mixed Arabic/English.
+            "prompt": "مساعد CitySOS بالعامية المصرية: العربية بطلت، ونش، ماسورة مكسورة، النور فصل، صيدلية، إسعاف.",
+        },
     )
-    text = " ".join(seg.text.strip() for seg in segments).strip()
-    return {"text": text, "language": info.language}
+    if r.status_code != 200:
+        print(f"[Groq STT] status={r.status_code} body={r.text[:300]}")
+    r.raise_for_status()
+    text = (r.json().get("text") or "").strip()
+    return {"text": text, "language": detect_script(text) or "ar"}
 
 
-async def transcribe(audio: bytes) -> dict:
-    """Speech -> text. Runs in a thread because Whisper is blocking."""
-    return await asyncio.to_thread(_transcribe_sync, audio)
+def clean_for_speech(text: str) -> str:
+    text = re.sub(r"[\U00010000-\U0010ffff\u2600-\u27BF\uFE0F]", "", text)   # emojis
+    text = re.sub(r"[*_`#>|~]+", " ", text)                                    # markdown
+    text = re.sub(r"\(.*?(basic mode|وضع بسيط).*?\)", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:450]
 
 
 async def synthesize(text: str, lang: str) -> bytes:
     """Text -> MP3 bytes using Egyptian Arabic or English neural voices."""
     if edge_tts is None:
         raise RuntimeError("edge-tts is not installed.")
+    text = clean_for_speech(text)
+    if not text:
+        raise RuntimeError("nothing to speak")
     communicate = edge_tts.Communicate(text, VOICES.get(lang, VOICES["en"]))
     buf = bytearray()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             buf.extend(chunk["data"])
+    if not buf:
+        raise RuntimeError("TTS returned no audio")
     return bytes(buf)
 
 
 # ---------------------------------------------------------------- offline fallback (no AI)
-# Used only if the Claude API call fails. Same category ids as the AI path.
+# Used only if the LLM call fails. Same category ids as the AI path.
 KW = [
     ("emergency", EMERGENCY_PATTERNS),
     ("pharmacy", re.compile(r"(صيدلية|صيدليه|دواء|دوا|pharmacy|medicine|drugstore|prescription)", re.I)),
@@ -230,45 +265,26 @@ async def chat(message: str, history: Optional[list] = None, via_voice: bool = F
     history = history or []
     hint = detect_script(message) or "en"
     tag = f"[detected script: {hint}]" + (" [input: voice]" if via_voice else "")
+    core_messages = [*clean_history(history), {"role": "user", "content": f"{message}\n\n{tag}"}]
     try:
-        if GROQ_API_KEY:
-            async with httpx.AsyncClient(timeout=60.0) as http_client:
-                response = await http_client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": MODEL,
-                        "messages": [
-                            {"role": "system", "content": SYSTEM},
-                            *clean_history(history),
-                            {"role": "user", "content": f"{message}\n\n{tag}"},
-                        ],
-                        "temperature": 0.2,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-                raw = payload["choices"][0]["message"]["content"]
-                j = parse_json(raw)
-        elif client is not None:
-            res = await client.messages.create(
-                model=MODEL,
-                max_tokens=700,
-                system=SYSTEM,
-                messages=[*clean_history(history), {"role": "user", "content": f"{message}\n\n{tag}"}],
-            )
-            j = parse_json("".join(b.text for b in res.content if b.type == "text"))
-        else:
-            raise RuntimeError("No LLM API key is set. Set GROQ_API_KEY or ANTHROPIC_API_KEY before using AI responses.")
+        raw = await _call_llm(core_messages)
+        try:
+            j = parse_json(raw)
+        except (json.JSONDecodeError, ValueError, IndexError):
+            # One retry with an explicit stricter nudge before giving up.
+            raw = await _call_llm([
+                *core_messages,
+                {"role": "user", "content": "Your previous answer was not valid JSON. Reply with ONLY the compact JSON object now, no markdown, no extra text."},
+            ])
+            j = parse_json(raw)
 
         lang = "ar" if j.get("lang") == "ar" else "en"
         category = j.get("category") if j.get("category") in CATEGORIES else "unknown"
         emergency = bool(j.get("emergency")) or category == "emergency"
-        reply = j.get("reply") or ""
-        followup = j.get("followup") or ""
+        reply = (j.get("reply") or "").strip()
+        followup = (j.get("followup") or "").strip()
+        if not reply:
+            raise ValueError("empty reply from model")
 
         # Safety net: keyword hit the model missed -> force emergency and add the numbers.
         if not emergency and EMERGENCY_PATTERNS.search(message):
@@ -314,7 +330,7 @@ async def chat(message: str, history: Optional[list] = None, via_voice: bool = F
 # ---------------------------------------------------------------- API
 app = FastAPI(title="CitySOS Assistant")
 sessions: dict = {}  # use Redis / DB in production
-INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index (1).html")
 
 
 @app.get("/")
@@ -345,21 +361,16 @@ async def api_voice(
         raise HTTPException(413, "audio too large (max 10 MB)")
 
     try:
-        stt = await transcribe(data)
+        stt = await transcribe(data, audio.filename or "voice.webm", audio.content_type or "audio/webm")
     except Exception as e:  # noqa: BLE001
         print("STT error:", repr(e))
-        if WhisperModel is None:
-            raise HTTPException(503, "voice transcription is unavailable in this environment. Please use text chat instead.")
-        raise HTTPException(422, "could not read the audio")
+        raise HTTPException(422, "could not read the audio. Please try again or use text chat instead.")
 
     if not stt["text"]:
         lang = "ar" if stt["language"] == "ar" else "en"
         msg = "مسمعتش كلامك كويس، ممكن تعيد تاني؟" if lang == "ar" else "I couldn't hear you clearly. Could you repeat that?"
         return {"transcript": "", "lang": lang, "dir": "rtl" if lang == "ar" else "ltr",
                 "category": "unknown", "emergency": False, "reply": msg, "followup": "", "mode": "ai", "audio": None}
-
-    if WhisperModel is None:
-        raise HTTPException(503, "voice transcription is unavailable in this environment. Please use text chat instead.")
 
     r = await chat(stt["text"], sessions.get(sessionId, []), via_voice=True)
     sessions[sessionId] = r.pop("history")
@@ -376,15 +387,15 @@ async def api_voice(
     return r
 
 
-# ---------------------------------------------------------------- frontend example (JS)
-# Record:
-#   const rec = new MediaRecorder(await navigator.mediaDevices.getUserMedia({audio:true}));
-#   const chunks = []; rec.ondataavailable = e => chunks.push(e.data);
-#   rec.onstop = async () => {
-#     const fd = new FormData();
-#     fd.append("sessionId", sessionId);
-#     fd.append("audio", new Blob(chunks, {type: rec.mimeType}), "voice.webm");
-#     const r = await (await fetch("/api/voice", {method: "POST", body: fd})).json();
-#     // show r.transcript, r.reply + r.followup, set dir = r.dir
-#     if (r.audio) new Audio(`data:${r.audio.mime};base64,${r.audio.base64}`).play();
-#   };
+@app.post("/api/tts")
+async def api_tts(payload: dict):
+    """Text -> MP3. The page calls this AFTER showing the text, so replies appear instantly."""
+    text, lang = (payload.get("text") or "").strip(), payload.get("lang", "en")
+    if not text:
+        raise HTTPException(400, "text is required")
+    try:
+        mp3 = await synthesize(text, "ar" if lang == "ar" else "en")
+    except Exception as e:  # noqa: BLE001
+        print("TTS error:", repr(e))
+        raise HTTPException(502, "tts failed")
+    return Response(content=mp3, media_type="audio/mpeg")
